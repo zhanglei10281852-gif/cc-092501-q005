@@ -2,7 +2,14 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Query
 
-from app.hydro.schemas import EndmemberCreate, InversionRequest, SampleCreate, TransportRequest, WellCreate
+from app.hydro.schemas import (
+    EndmemberCreate,
+    InversionRequest,
+    SampleCreate,
+    SegmentTransportRequest,
+    TransportRequest,
+    WellCreate,
+)
 from app.hydro.service import HydroService
 
 router=APIRouter(prefix="/api/hydro",tags=["地下水科学计算"])
@@ -51,3 +58,25 @@ def run_inversion(task_id:int,worker_id:str=Query(...,min_length=1)):
 def run_transport(well_id:int,payload:TransportRequest):
     try: return service().run_transport(well_id,payload.model_dump())
     except KeyError as exc: raise HTTPException(404,"井点不存在") from exc
+
+@router.post("/wells/{well_id}/segment-transport",status_code=201)
+def run_segment_transport(well_id:int,payload:SegmentTransportRequest):
+    try:
+        record = service().run_segment_transport(well_id,payload.model_dump())
+    except KeyError as exc:
+        raise HTTPException(404,"井点不存在") from exc
+    except ValueError as exc:
+        # 区段顺序错误、单位不一致、时间网格非法等配置问题
+        raise HTTPException(422,f"迁移配置被拒绝:{exc}") from exc
+    if record.pop("_rejected", None):
+        raise HTTPException(
+            422,
+            f"迁移结果因质量误差超限被拒绝:{record.get('error')}",
+        )
+    return record
+
+@router.get("/transport-runs/{run_id}")
+def get_transport_run(run_id:int):
+    record = service().get_transport_run(run_id)
+    if record is None: raise HTTPException(404,"迁移计算记录不存在")
+    return record

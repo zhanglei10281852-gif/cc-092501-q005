@@ -6,8 +6,8 @@
 
 - 井点与样本：登记井点坐标、含水层、采样批次和实验室测量结果。
 - 同位素计算：处理稳定同位素、溶质浓度、检测限和质量守恒约束，反演多个补给端元比例。
-- 污染迁移：计算一维平流、弥散和一阶衰减，提供到达时间和浓度曲线。
-- 任务与审计：保存参数版本、计算输入摘要、置信区间、失败重试和结果差异。
+- 污染迁移：一维平流、弥散和一阶衰减。单段计算给出到达时间和浓度曲线；分段计算接受从源区到监测井的**有序含水层区段**(每段含长度、孔隙流速、弥散系数和一阶衰减),以区段脉冲响应串联卷积保证**区段接口质量通量连续**,输出目标井突破曲线、峰值、首达时间与累计质量,并对区段顺序、单位一致性和质量守恒误差进行校验,不合格即拒绝结果。
+- 任务与审计：保存模型与参数版本、计算输入摘要、突破曲线、置信/质量守恒指标、失败重试和结果差异。相同配置重复运行复用同一条记录,可追溯采用的参数版本。
 - 身份与权限：用户、角色、细粒度权限、会话令牌、账号停用和会话撤销。
 - 审计记录：关键身份操作留痕，并对口令和令牌等敏感字段做过滤。
 - 后台任务：使用 SQLite 保存待执行任务，支持去重、租约、重试和完成回执。
@@ -46,6 +46,48 @@ uvicorn app.main:app --host 0.0.0.0 --port 8432
 ```bash
 curl -sS http://127.0.0.1:8432/api/system/health
 ```
+
+## 分段污染迁移
+
+污染羽从源区到监测井会穿过渗透系数与衰减条件不同的含水层区段。分段迁移接口
+`POST /api/hydro/wells/{well_id}/segment-transport` 接受按源区 → 监测井方向排序的
+区段序列,每段给出长度、孔隙流速、弥散系数和一阶衰减;可选用 `start_m`/`end_m`
+里程坐标显式锁定区段接口衔接与方向。
+
+```json
+{
+  "source_mass_kg": 1000.0,
+  "distance_m": 100.0,
+  "segments": [
+    {"length_m": 50, "velocity_m_day": 1.0, "dispersion_m2_day": 2.0, "decay_per_day": 0.0,
+     "start_m": 0, "end_m": 50},
+    {"length_m": 30, "velocity_m_day": 0.6, "dispersion_m2_day": 5.0, "decay_per_day": 0.01,
+     "start_m": 50, "end_m": 80},
+    {"length_m": 20, "velocity_m_day": 2.0, "dispersion_m2_day": 1.0, "decay_per_day": 0.0,
+     "start_m": 80, "end_m": 100}
+  ],
+  "duration_days": 1200.0,
+  "step_days": 1.0,
+  "first_arrival_quantile": 0.01,
+  "mass_tolerance": 0.02,
+  "model_version": "ade-segment-1",
+  "parameter_version": "param-2026q3",
+  "units": {"length": "m", "time": "day", "mass": "kg",
+            "velocity": "m/day", "dispersion": "m2/day", "decay": "1/day"}
+}
+```
+
+返回记录中 `result_json` 含突破曲线 `points`、`peak`、`first_arrival_time_days`、
+`cumulative_mass_kg` 与解析期望质量、质量误差、各段存活率和参数版本。求解采用区段
+脉冲响应(逆高斯首达密度 × 一阶衰减存活因子)逐级卷积,上段出流质量通量即下段入流,
+接口质量通量连续。以下情况返回 422 拒绝:
+
+- 区段长度合计与 `distance_m` 不闭合,或里程坐标未衔接/方向倒退(顺序错误);
+- `units` 与规范单位制(m、day、kg、m/day、m²/day、1/day)不一致或缺漏;
+- 时间窗口未覆盖完整突破过程,数值累计质量与解析期望质量偏差超过 `mass_tolerance`。
+
+相同配置(含 `parameter_version`)哈希为同一 `task_key`,重复运行返回同一记录;
+`GET /api/hydro/transport-runs/{id}` 可追溯完整输入、模型版本与参数版本。
 
 首次部署可创建唯一的初始管理员：
 

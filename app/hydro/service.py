@@ -8,6 +8,11 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.database import get_connection, transaction
+from app.hydro.transport import (
+    MassBalanceError,
+    TransportValidationError,
+    solve_segment_transport,
+)
 
 
 SCHEMA = """
@@ -37,8 +42,11 @@ CREATE TABLE IF NOT EXISTS hydro_inversions (
 );
 CREATE TABLE IF NOT EXISTS hydro_transport_runs (
  id INTEGER PRIMARY KEY AUTOINCREMENT, well_id INTEGER NOT NULL REFERENCES hydro_wells(id) ON DELETE RESTRICT,
- task_key TEXT NOT NULL UNIQUE, model_version TEXT NOT NULL, input_json TEXT NOT NULL,
- status TEXT NOT NULL DEFAULT 'queued', result_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+ task_key TEXT NOT NULL UNIQUE, run_type TEXT NOT NULL DEFAULT 'single',
+ model_version TEXT NOT NULL, parameter_version TEXT NOT NULL DEFAULT '',
+ input_json TEXT NOT NULL,
+ status TEXT NOT NULL DEFAULT 'queued', result_json TEXT NOT NULL DEFAULT '{}', error TEXT NOT NULL DEFAULT '',
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS hydro_audit (
  id INTEGER PRIMARY KEY AUTOINCREMENT, resource_type TEXT NOT NULL, resource_id INTEGER,
@@ -55,6 +63,18 @@ def _now() -> str:
 
 def ensure_schema() -> None:
     get_connection().executescript(SCHEMA)
+    # 兼容基线数据库:为既有 hydro_transport_runs 补齐分段计算所需列
+    columns = {
+        row["name"]
+        for row in get_connection().execute("PRAGMA table_info(hydro_transport_runs)").fetchall()
+    }
+    if columns:
+        if "run_type" not in columns:
+            get_connection().execute("ALTER TABLE hydro_transport_runs ADD COLUMN run_type TEXT NOT NULL DEFAULT 'single'")
+        if "parameter_version" not in columns:
+            get_connection().execute("ALTER TABLE hydro_transport_runs ADD COLUMN parameter_version TEXT NOT NULL DEFAULT ''")
+        if "error" not in columns:
+            get_connection().execute("ALTER TABLE hydro_transport_runs ADD COLUMN error TEXT NOT NULL DEFAULT ''")
 
 
 def _digest(value: Any) -> str:
@@ -181,3 +201,55 @@ class HydroService:
         with transaction(immediate=True) as connection:
             cursor=connection.execute("INSERT INTO hydro_transport_runs(well_id,task_key,model_version,input_json,status,result_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",(well_id,key,payload["model_version"],json.dumps(payload,ensure_ascii=False),"done",json.dumps(result,ensure_ascii=False),now,now))
             return dict(connection.execute("SELECT * FROM hydro_transport_runs WHERE id=?",(cursor.lastrowid,)).fetchone())
+
+    def run_segment_transport(self, well_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+        """按源区 -> 监测井方向的有序区段计算分段 ADR 迁移。
+
+        相同配置(井 + 全部输入含 parameter_version)哈希出同一 task_key,重复运行直接
+        返回已留存的结果,保证可追溯。区段顺序/单位/质量误差不合格时求解器抛错,
+        不写入成功结果;质量误差超限的拒绝也会留一条 rejected 记录便于审计追溯。
+        """
+        if self.connection.execute("SELECT id FROM hydro_wells WHERE id=?",(well_id,)).fetchone() is None:
+            raise KeyError("well_not_found")
+        key = _digest({"well_id": well_id, "run_type": "segment", **payload})
+        now = _now()
+        old = self.connection.execute(
+            "SELECT * FROM hydro_transport_runs WHERE task_key=?", (key,)
+        ).fetchone()
+        if old:
+            record = dict(old)
+            if record.get("status") == "rejected":
+                record["_rejected"] = record.get("error", "rejected")
+            return record
+        try:
+            result = solve_segment_transport(payload)
+        except MassBalanceError as exc:
+            with transaction(immediate=True) as connection:
+                cursor = connection.execute(
+                    "INSERT INTO hydro_transport_runs(well_id,task_key,run_type,model_version,parameter_version,input_json,status,result_json,error,created_at,updated_at)"
+                    " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (well_id, key, "segment", payload["model_version"], payload["parameter_version"],
+                     json.dumps(payload, ensure_ascii=False), "rejected", "{}", str(exc), now, now),
+                )
+                record = dict(connection.execute(
+                    "SELECT * FROM hydro_transport_runs WHERE id=?", (cursor.lastrowid,)
+                ).fetchone())
+            record["_rejected"] = str(exc)
+            return record
+        with transaction(immediate=True) as connection:
+            cursor = connection.execute(
+                "INSERT INTO hydro_transport_runs(well_id,task_key,run_type,model_version,parameter_version,input_json,status,result_json,created_at,updated_at)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (well_id, key, "segment", payload["model_version"], payload["parameter_version"],
+                 json.dumps(payload, ensure_ascii=False), "done",
+                 json.dumps(result, ensure_ascii=False), now, now),
+            )
+            return dict(connection.execute(
+                "SELECT * FROM hydro_transport_runs WHERE id=?", (cursor.lastrowid,)
+            ).fetchone())
+
+    def get_transport_run(self, run_id: int) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            "SELECT * FROM hydro_transport_runs WHERE id=?", (run_id,)
+        ).fetchone()
+        return dict(row) if row else None
