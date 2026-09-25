@@ -8,6 +8,13 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.database import get_connection, transaction
+from app.hydro.transport import (
+    SOLVER_VERSION,
+    TransportError,
+    normalize_config,
+    parameter_fingerprint,
+    simulate,
+)
 
 
 SCHEMA = """
@@ -38,7 +45,9 @@ CREATE TABLE IF NOT EXISTS hydro_inversions (
 CREATE TABLE IF NOT EXISTS hydro_transport_runs (
  id INTEGER PRIMARY KEY AUTOINCREMENT, well_id INTEGER NOT NULL REFERENCES hydro_wells(id) ON DELETE RESTRICT,
  task_key TEXT NOT NULL UNIQUE, model_version TEXT NOT NULL, input_json TEXT NOT NULL,
- status TEXT NOT NULL DEFAULT 'queued', result_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+ status TEXT NOT NULL DEFAULT 'queued', result_json TEXT NOT NULL DEFAULT '{}',
+ solver_version TEXT NOT NULL DEFAULT 'ade-1', parameter_fingerprint TEXT NOT NULL DEFAULT '',
+ segment_count INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS hydro_audit (
  id INTEGER PRIMARY KEY AUTOINCREMENT, resource_type TEXT NOT NULL, resource_id INTEGER,
@@ -55,6 +64,21 @@ def _now() -> str:
 
 def ensure_schema() -> None:
     get_connection().executescript(SCHEMA)
+    _migrate_transport_table()
+
+
+def _migrate_transport_table() -> None:
+    """为旧库补齐分段迁移所需列（CREATE TABLE IF NOT EXISTS 不会更新既有表）。"""
+    connection = get_connection()
+    columns = {row["name"] for row in connection.execute("PRAGMA table_info(hydro_transport_runs)").fetchall()}
+    additions = {
+        "solver_version": "TEXT NOT NULL DEFAULT 'ade-1'",
+        "parameter_fingerprint": "TEXT NOT NULL DEFAULT ''",
+        "segment_count": "INTEGER NOT NULL DEFAULT 1",
+    }
+    for name, declaration in additions.items():
+        if name not in columns:
+            connection.execute(f"ALTER TABLE hydro_transport_runs ADD COLUMN {name} {declaration}")
 
 
 def _digest(value: Any) -> str:
@@ -166,18 +190,106 @@ class HydroService:
             connection.execute("UPDATE hydro_inversions SET status='done',result_json=?,error='',updated_at=? WHERE id=?",(json.dumps(result,ensure_ascii=False),_now(),task_id))
             return dict(connection.execute("SELECT * FROM hydro_inversions WHERE id=?",(task_id,)).fetchone())
 
-    def run_transport(self, well_id: int, payload: dict[str, Any]) -> dict[str, Any]:
-        if self.connection.execute("SELECT id FROM hydro_wells WHERE id=?",(well_id,)).fetchone() is None: raise KeyError("well_not_found")
-        key=_digest({"well_id":well_id,**payload}); now=_now()
-        old=self.connection.execute("SELECT * FROM hydro_transport_runs WHERE task_key=?",(key,)).fetchone()
-        if old: return dict(old)
-        points=[]; t=payload["step_days"]
-        while t<=payload["duration_days"]+1e-12:
-            d=payload["dispersion_m2_day"]; x=payload["distance_m"]; v=payload["velocity_m_day"]
-            c=payload["source_concentration"]*math.exp(-((x-v*t)**2)/(4*d*t))*math.exp(-payload["decay_per_day"]*t)/math.sqrt(4*math.pi*d*t)
-            points.append({"time_days":round(t,8),"concentration":c}); t+=payload["step_days"]
-        peak=max(points,key=lambda p:p["concentration"])
-        result={"points":points,"peak":peak,"arrival_time_days":payload["distance_m"]/payload["velocity_m_day"],"model_version":payload["model_version"]}
+    def _transport_task_key(self, well_id: int, config) -> str:
+        canonical = {
+            "well_id": well_id,
+            "model_version": config.model_version,
+            "source_mass": config.source_mass,
+            "duration_days": config.duration_days,
+            "step_days": config.step_days,
+            "detection_limit": config.detection_limit,
+            "relative_threshold": config.relative_threshold,
+            "mass_error_tolerance": config.mass_error_tolerance,
+            "segments": [
+                {
+                    "length_m": s.length_m,
+                    "velocity_m_day": s.velocity_m_day,
+                    "dispersion_m2_day": s.dispersion_m2_day,
+                    "decay_per_day": s.decay_per_day,
+                    "parameter_version": s.parameter_version,
+                }
+                for s in config.segments
+            ],
+        }
+        return _digest(canonical)
+
+    def _find_rejected(self, key: str) -> dict[str, Any] | None:
+        old = self.connection.execute("SELECT * FROM hydro_transport_runs WHERE task_key=?", (key,)).fetchone()
+        if old is None:
+            return None
+        if old["status"] == "rejected":
+            stored = json.loads(old["result_json"] or "{}")
+            raise TransportError(stored.get("rejection", "invalid_transport_config"),
+                                 stored.get("message", "该配置此前已被拒绝"), stored)
+        return dict(old)
+
+    def _insert_rejected(self, well_id: int, key: str, model_version: str, payload: dict[str, Any],
+                         exc: TransportError, segment_count: int, fingerprint: str, now: str) -> None:
+        # 拒绝结果同样留痕：状态 rejected，记录拒绝原因与上下文，不产出突破曲线
         with transaction(immediate=True) as connection:
-            cursor=connection.execute("INSERT INTO hydro_transport_runs(well_id,task_key,model_version,input_json,status,result_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",(well_id,key,payload["model_version"],json.dumps(payload,ensure_ascii=False),"done",json.dumps(result,ensure_ascii=False),now,now))
-            return dict(connection.execute("SELECT * FROM hydro_transport_runs WHERE id=?",(cursor.lastrowid,)).fetchone())
+            connection.execute(
+                "INSERT INTO hydro_transport_runs(well_id,task_key,model_version,input_json,status,"
+                "result_json,solver_version,parameter_fingerprint,segment_count,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (well_id, key, model_version, json.dumps(payload, ensure_ascii=False), "rejected",
+                 json.dumps({"rejection": exc.code, "message": exc.message, **exc.context}, ensure_ascii=False),
+                 SOLVER_VERSION, fingerprint, segment_count, now, now),
+            )
+
+    def run_transport(self, well_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+        if self.connection.execute("SELECT id FROM hydro_wells WHERE id=?",(well_id,)).fetchone() is None:
+            raise KeyError("well_not_found")
+        now = _now()
+        try:
+            config = normalize_config(payload)
+        except TransportError as exc:
+            # 参数校验拒绝（区段顺序/单位/取值）：用原始负载取键，保证同一坏配置重复提交不重复留痕
+            raw_segments = payload.get("segments")
+            segment_count = len(raw_segments) if isinstance(raw_segments, list) else 0
+            key = _digest({"well_id": well_id, "rejected": True, "payload": payload})
+            previous = self._find_rejected(key)
+            if previous is not None:
+                return previous
+            self._insert_rejected(well_id, key, str(payload.get("model_version") or SOLVER_VERSION),
+                                  payload, exc, segment_count, "", now)
+            raise
+
+        key = self._transport_task_key(well_id, config)
+        previous = self._find_rejected(key)
+        if previous is not None:
+            return previous
+
+        try:
+            result = simulate(config)
+        except TransportError as exc:
+            self._insert_rejected(well_id, key, config.model_version, payload, exc,
+                                  len(config.segments), parameter_fingerprint(config), now)
+            raise
+
+        with transaction(immediate=True) as connection:
+            cursor = connection.execute(
+                "INSERT INTO hydro_transport_runs(well_id,task_key,model_version,input_json,status,"
+                "result_json,solver_version,parameter_fingerprint,segment_count,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (well_id, key, config.model_version, json.dumps(payload, ensure_ascii=False), "done",
+                 json.dumps(result, ensure_ascii=False), result["solver_version"],
+                 result["parameter_fingerprint"], len(config.segments), now, now),
+            )
+            return dict(connection.execute("SELECT * FROM hydro_transport_runs WHERE id=?", (cursor.lastrowid,)).fetchone())
+
+    def get_transport_run(self, run_id: int) -> dict[str, Any] | None:
+        row = self.connection.execute("SELECT * FROM hydro_transport_runs WHERE id=?", (run_id,)).fetchone()
+        return dict(row) if row else None
+
+    def list_transport_runs(self, well_id: int | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        limit = max(1, min(int(limit), 500))
+        if well_id is None:
+            rows = self.connection.execute(
+                "SELECT * FROM hydro_transport_runs ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
+        else:
+            rows = self.connection.execute(
+                "SELECT * FROM hydro_transport_runs WHERE well_id=? ORDER BY id DESC LIMIT ?",
+                (well_id, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]

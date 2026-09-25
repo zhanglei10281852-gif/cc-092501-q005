@@ -6,11 +6,20 @@
 
 - 井点与样本：登记井点坐标、含水层、采样批次和实验室测量结果。
 - 同位素计算：处理稳定同位素、溶质浓度、检测限和质量守恒约束，反演多个补给端元比例。
-- 污染迁移：计算一维平流、弥散和一阶衰减，提供到达时间和浓度曲线。
+- 污染迁移：按从源区到监测井的有序含水层区段（长度、孔隙流速、弥散系数、一阶衰减）计算一维平流-弥散-衰减迁移；区段接口质量通量连续，输出目标井突破曲线、峰值、首达时间与累计质量；区段顺序错误、单位不一致或质量误差超限会被拒绝并留痕；相同配置幂等复用，可按参数版本指纹追溯。
 - 任务与审计：保存参数版本、计算输入摘要、置信区间、失败重试和结果差异。
 - 身份与权限：用户、角色、细粒度权限、会话令牌、账号停用和会话撤销。
 - 审计记录：关键身份操作留痕，并对口令和令牌等敏感字段做过滤。
 - 后台任务：使用 SQLite 保存待执行任务，支持去重、租约、重试和完成回执。
+
+## 分段污染迁移计算
+
+`POST /api/hydro/wells/{well_id}/transport` 接受两种负载：
+
+- **分段模式（推荐）**：`segments` 为从源区到监测井的有序区段列表，每段含 `length`、`pore_velocity`、`dispersion`、`decay_rate` 与可选 `parameter_version`、`sequence`、`code`；另需 `source_mass`、`duration`、`step`。区段接口上质量通量连续（各段通量型逆高斯核卷积），返回突破曲线 `points`（含逐点 `cumulative_mass`）、`peak`、`first_arrival_days`、`cumulative_mass`、`expected_mass`、`mass_error` 与逐接口 `interface_flux`。
+- **单一区段（兼容旧版）**：`source_concentration`、`distance_m`、`velocity_m_day`、`dispersion_m2_day`、`decay_per_day`、`duration_days`、`step_days`，内部视为一个区段。
+
+单位可用 `length_unit`（m/km）与 `time_unit`（day/hour/second）声明，内部统一换算为米·天；区段级单位与运行级不一致会被拒绝。以下情况返回 422 并以 `status=rejected` 留痕（不产出曲线）：区段顺序错误（`segments_out_of_order`）、单位不一致（`inconsistent_units`）、质量误差超门限（`mass_error_exceeded`，响应中附建议的模拟时长 `suggested_duration`）。相同配置重复提交返回同一记录（幂等）；`GET /api/hydro/transport/runs/{id}` 与 `GET /api/hydro/transport/runs?well_id=` 可追溯历史运行采用的输入、求解器版本与参数版本指纹。
 
 ## 运行环境
 

@@ -44,13 +44,37 @@ class InversionRequest(BaseModel):
     model_version: str = Field(default="mix-1", min_length=1, max_length=40)
 
 
+class TransportSegment(BaseModel):
+    """有序含水层区段：从源区到监测井依次排列。"""
+    sequence: int | None = Field(default=None, ge=1)
+    code: str | None = Field(default=None, min_length=1, max_length=60)
+    length: float = Field(..., gt=0, le=1000000)
+    pore_velocity: float = Field(..., gt=0, le=10000)
+    dispersion: float = Field(..., gt=0, le=100000)
+    decay_rate: float = Field(default=0, ge=0, le=100)
+    parameter_version: str | None = Field(default=None, min_length=1, max_length=40)
+    length_unit: str | None = Field(default=None)
+    time_unit: str | None = Field(default=None)
+
+
 class TransportRequest(BaseModel):
-    source_concentration: float = Field(..., ge=0, le=1000000)
-    distance_m: float = Field(..., gt=0, le=1000000)
-    velocity_m_day: float = Field(..., gt=0, le=10000)
-    dispersion_m2_day: float = Field(..., gt=0, le=100000)
+    # 分段模式：有序区段列表（优先）；缺省时回退到下方单一区段参数
+    segments: list[TransportSegment] | None = Field(default=None, min_length=1, max_length=50)
+    source_mass: float | None = Field(default=None, gt=0, le=1000000)
+    duration: float | None = Field(default=None, gt=0, le=100000)
+    step: float | None = Field(default=None, gt=0, le=1000)
+    length_unit: str = Field(default="m", pattern="^(m|km)$")
+    time_unit: str = Field(default="day", pattern="^(day|hour|second)$")
+    detection_limit: float = Field(default=0, ge=0, le=100000)
+    relative_threshold: float = Field(default=1e-3, gt=0, lt=1)
+    mass_error_tolerance: float = Field(default=0.01, ge=1e-6, le=0.25)
+    # 单一区段（旧版）参数
+    source_concentration: float | None = Field(default=None, ge=0, le=1000000)
+    distance_m: float | None = Field(default=None, gt=0, le=1000000)
+    velocity_m_day: float | None = Field(default=None, gt=0, le=10000)
+    dispersion_m2_day: float | None = Field(default=None, gt=0, le=100000)
     decay_per_day: float = Field(default=0, ge=0, le=100)
-    duration_days: float = Field(..., gt=0, le=100000)
+    duration_days: float | None = Field(default=None, gt=0, le=100000)
     step_days: float = Field(default=1, gt=0, le=1000)
     model_version: str = Field(default="ade-1", min_length=1, max_length=40)
 

@@ -4,10 +4,14 @@ from fastapi import APIRouter, HTTPException, Query
 
 from app.hydro.schemas import EndmemberCreate, InversionRequest, SampleCreate, TransportRequest, WellCreate
 from app.hydro.service import HydroService
+from app.hydro.transport import TransportError
 
 router=APIRouter(prefix="/api/hydro",tags=["地下水科学计算"])
 
 def service()->HydroService: return HydroService()
+
+def _reject_transport(exc: TransportError) -> HTTPException:
+    return HTTPException(422, detail={"code": exc.code, "message": exc.message, "context": exc.context})
 
 @router.post("/wells",status_code=201)
 def create_well(payload:WellCreate):
@@ -49,5 +53,17 @@ def run_inversion(task_id:int,worker_id:str=Query(...,min_length=1)):
 
 @router.post("/wells/{well_id}/transport",status_code=201)
 def run_transport(well_id:int,payload:TransportRequest):
-    try: return service().run_transport(well_id,payload.model_dump())
+    try:
+        return service().run_transport(well_id,payload.model_dump(exclude_none=True))
     except KeyError as exc: raise HTTPException(404,"井点不存在") from exc
+    except TransportError as exc: raise _reject_transport(exc) from exc
+
+@router.get("/transport/runs/{run_id}")
+def get_transport_run(run_id:int):
+    value = service().get_transport_run(run_id)
+    if value is None: raise HTTPException(404,"迁移计算记录不存在")
+    return value
+
+@router.get("/transport/runs")
+def list_transport_runs(well_id:int|None=Query(default=None),limit:int=Query(default=100,ge=1,le=500)):
+    return {"items": service().list_transport_runs(well_id=well_id,limit=limit)}
